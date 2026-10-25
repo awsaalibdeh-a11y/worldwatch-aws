@@ -1,0 +1,14 @@
+﻿# Deploy after 2026-11-01 (Render free hours reset): New Web Service from this folder, free plan.
+# Environment variable to set once: OPENAI_API_KEY (already validated, in ../../.env). Then put the service URL + /api/aws in site/data/config.json as "aiProxy".
+services:
+  - type: web
+    name: worldwatch-aws
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 60
+    envVars:
+      - key: WW_SITE
+        value: https://death242-worldwatch.static.hf.space
+      - key: OPENAI_API_KEY
+        sync: false
