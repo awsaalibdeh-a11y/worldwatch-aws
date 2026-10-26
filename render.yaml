@@ -1,7 +1,9 @@
 # Deploy after 2026-11-01 (Render free hours reset): New Web Service from this folder, free plan.
 # Environment variables to set once:
 #   OPENAI_API_KEY     the key the proxy spends (already validated, in ../../.env)
-#   AWS_PROMPT_SHA256  hex sha256 of the exact Aws system prompt: python prompt_sha256.py site/prompt.txt
+#   AWS_PROMPT_SHA256  comma-separated sha256 of each Aws prompt variant's fixed part (briefing, place, chat).
+#                      Only the text before '=== DATA (untrusted) ===' is fingerprinted, so live map data is fine.
+#                      Generate: python prompt_sha256.py briefing.txt place.txt chat.txt
 # Then put the service URL + /api/aws in site/data/config.json as "aiProxy".
 services:
   - type: web

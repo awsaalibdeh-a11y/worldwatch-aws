@@ -28,6 +28,7 @@ import collections, hashlib, json, logging, os, threading, time
 
 import requests
 from flask import Flask, Response, jsonify, request
+from werkzeug.exceptions import HTTPException
 
 SITE = os.environ.get("WW_SITE", "https://death242-worldwatch.static.hf.space")
 ALLOWED_MODELS = {"gpt-5-mini"}
@@ -39,7 +40,22 @@ VERSION = "3"
 STARTED = time.time()
 
 AWS_SYSTEM_PREFIX = "You are Aws"
-AWS_PROMPT_SHA256 = os.environ.get("AWS_PROMPT_SHA256", "").strip().lower()
+
+# The site's system prompt is not one fixed string. It is a fixed instruction block followed by a live
+# briefing, and the live part changes on every request (map data, task choice). Hashing the whole message
+# therefore refused every real call. Only the fixed block is fingerprinted.
+#
+#   <fixed instructions>            <- fingerprinted, must equal one of AWS_PROMPT_SHA256
+#   === DATA (untrusted) ===        <- anything after this line is ignored
+#   <live map / world data>
+#
+# The marker is the split between trusted text and untrusted data, so it must appear exactly once and only
+# the text before it is checked.
+DATA_MARKER = "=== DATA (untrusted) ==="
+# Accepted fingerprints: comma-separated hex digests, one per task variant (briefing / place / chat).
+AWS_PROMPT_SHA256S = tuple(h.strip().lower() for h in os.environ.get("AWS_PROMPT_SHA256", "").split(",") if h.strip())
+# Kept as an alias so older deploys and the tests that read it keep working.
+AWS_PROMPT_SHA256 = AWS_PROMPT_SHA256S[0] if AWS_PROMPT_SHA256S else ""
 
 COUNTER_KEYS = ("requests", "upstream", "cache_hits", "rate_limited", "refused", "budget_refused", "errors")
 
@@ -50,8 +66,10 @@ app = Flask(__name__)
 hits = collections.defaultdict(list)
 hits_lock = threading.Lock()
 
-if not AWS_PROMPT_SHA256:
+if not AWS_PROMPT_SHA256S:
     log.warning("AWS_PROMPT_SHA256 is not set: falling back to the prefix check, which is not a real allow-list")
+else:
+    log.info("AWS_PROMPT_SHA256 accepts %d prompt variant(s)", len(AWS_PROMPT_SHA256S))
 
 
 def cors(resp):
@@ -69,19 +87,56 @@ def always_cors(resp):
     return cors(resp)
 
 
+# Which X-Forwarded-For entry is the visitor. This CANNOT be settled by reasoning: it depends on how many
+# proxies sit in front of the app and what each one appends. The wrong choice is not loud — it silently
+# gives every visitor the same identity, so they all share one rate limit.
+#
+#   "right" (default)  the last entry: what the nearest edge appended. Correct for Render, whose proxy
+#                      appends the peer address and strips a caller-supplied chain.
+#   "left"             the first entry: the address the original caller claimed. Correct when the app sits
+#                      behind a chain that preserves the client's own value at the head.
+#   "remote"           ignore the header entirely and use the socket peer.
+#
+# Check it on the live proxy with GET /health/ip while sending a known X-Forwarded-For. If the reported
+# address is Render's own load balancer for every visitor, switch this to "remote" or "left".
+IP_SOURCE = os.environ.get("AWS_IP_SOURCE", "right").strip().lower()
+
+
 @app.errorhandler(Exception)
 def on_error(exc):
-    """Never let an unhandled error reach the browser as a bare HTML 500."""
+    """Never let an unhandled error reach the browser as a bare HTML 500.
+
+    HTTP errors (404 for an unknown path, 405 for a wrong method) are normal answers, not faults. Letting
+    them fall through to this handler turned every bot probe into a 500 and wrote a full traceback to the
+    log, which both inflated the error counter and buried real faults. Answer them plainly instead.
+    """
+    if isinstance(exc, HTTPException):
+        return jsonify(error={"message": exc.description}), exc.code
     budget.note("errors")
     log.exception("unhandled error on %s", request.path)
     return jsonify(error={"message": "server error"}), 500
 
 
+def fixed_part(text):
+    """The trusted instruction block: everything before the data marker, with trailing whitespace trimmed.
+
+    Returns None when the marker is absent or appears more than once. More than one occurrence means the
+    caller is trying to hide extra instructions after a second marker, so the message is refused.
+    """
+    if text.count(DATA_MARKER) != 1:
+        return None
+    return text.split(DATA_MARKER, 1)[0].strip()
+
+
 def is_aws_prompt(text):
-    """True only for the exact Aws system prompt."""
-    if AWS_PROMPT_SHA256:
-        return hashlib.sha256(text.encode()).hexdigest() == AWS_PROMPT_SHA256
-    return text.startswith(AWS_SYSTEM_PREFIX)
+    """True when the trusted part of the system message is one of the accepted Aws prompt variants."""
+    head = fixed_part(text)
+    if head is None:
+        return False
+    if AWS_PROMPT_SHA256S:
+        digest = hashlib.sha256(head.encode()).hexdigest()
+        return digest in AWS_PROMPT_SHA256S
+    return head.startswith(AWS_SYSTEM_PREFIX)
 
 
 def check_request(body):
@@ -118,17 +173,24 @@ def check_request(body):
             "messages": [{"role": m["role"], "content": m["content"]} for m in msgs]}, None
 
 
-def client_ip():
-    """The real client address.
-
-    On Render the last X-Forwarded-For entry is appended by Render's own edge, so it is the only one
-    that cannot be forged by the caller. Earlier entries are attacker-controlled.
-    """
+def forwarded_chain():
+    """Every X-Forwarded-For entry, left to right, as the caller sent them."""
     raw = request.headers.get("X-Forwarded-For", "")
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    if parts:
-        return parts[-1]
-    return request.remote_addr or "?"
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def client_ip():
+    """The visitor's address, by the policy in IP_SOURCE.
+
+    This is the only place the choice is made, so the rate limiter and the diagnostic endpoint can never
+    disagree. See the comment on IP_SOURCE for why the right answer is a deployment fact, not a guess.
+    """
+    chain = forwarded_chain()
+    if IP_SOURCE == "remote" or not chain:
+        return request.remote_addr or "?"
+    if IP_SOURCE == "left":
+        return chain[0]
+    return chain[-1]
 
 
 def rate_limited(who, now=None):
@@ -268,6 +330,26 @@ def health():
     admin = os.environ.get("AWS_ADMIN_TOKEN")
     if admin and request.headers.get("X-Admin-Token") == admin:
         payload["today"] = budget.today()
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/health/ip", methods=["GET", "OPTIONS"])
+def health_ip():
+    """Shows how the proxy identifies the caller, so the X-Forwarded-For policy can be checked on the live
+    service instead of assumed. Behind AWS_ADMIN_TOKEN: it reveals the shape of your edge, not just a number.
+
+    Open it twice from two different networks (phone on mobile data, laptop on wifi). If `chosen` is the
+    same for both, every visitor is sharing one rate limit and AWS_IP_SOURCE needs setting.
+    """
+    if request.method == "OPTIONS":
+        return Response(status=204)
+    admin = os.environ.get("AWS_ADMIN_TOKEN")
+    if not admin or request.headers.get("X-Admin-Token") != admin:
+        return jsonify(error={"message": "not found"}), 404
+    payload = {"source": IP_SOURCE, "chain": forwarded_chain(),
+               "remote_addr": request.remote_addr, "chosen": client_ip()}
     resp = jsonify(payload)
     resp.headers["Cache-Control"] = "no-store"
     return resp

@@ -9,7 +9,7 @@ A tiny Flask server for Journalist Aws (the AI correspondent in World Watch, mad
 
 | Check | How |
 |---|---|
-| Aws prompts only | The system prompt is matched by **SHA-256** against `AWS_PROMPT_SHA256`, not by prefix. A conversation must also contain at least one user turn. |
+| Aws prompts only | The **fixed part** of the system prompt (everything before `=== DATA (untrusted) ===`) must match a SHA-256 in `AWS_PROMPT_SHA256`. The live data after the marker is not fingerprinted, and the marker must appear exactly once. A conversation must also contain at least one user turn. |
 | Allowed model | `gpt-5-mini` only |
 | Size | ≤ 12 messages, ≤ 40 000 characters total |
 | Tokens | `max_completion_tokens` clamped to 1–1000 (0 means 1) |
@@ -24,7 +24,7 @@ Identical requests (the same world briefing asked by many visitors) are answered
 Required:
 
 - `OPENAI_API_KEY` — the key the proxy spends.
-- `AWS_PROMPT_SHA256` — hex SHA-256 of the exact system prompt the site sends. Generate it with `python prompt_sha256.py <prompt-file>`. If unset, the proxy logs a warning and falls back to the old prefix check, which is **not** a real allow-list.
+- `AWS_PROMPT_SHA256` — comma-separated hex SHA-256 digests, one per Aws task variant (briefing, place, chat). Only the text before `=== DATA (untrusted) ===` is hashed, so the changing map data does not affect it. Generate all of them at once with `python prompt_sha256.py briefing.txt place.txt chat.txt`, or pipe a captured system message into `python prompt_sha256.py`. If unset, the proxy logs a warning and falls back to the old prefix check, which is **not** a real allow-list. If set, it must contain every variant the site sends, or the missing ones are refused.
 
 Optional:
 
