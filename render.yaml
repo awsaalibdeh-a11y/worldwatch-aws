@@ -1,14 +1,25 @@
-﻿# Deploy after 2026-11-01 (Render free hours reset): New Web Service from this folder, free plan.
-# Environment variable to set once: OPENAI_API_KEY (already validated, in ../../.env). Then put the service URL + /api/aws in site/data/config.json as "aiProxy".
+# Deploy after 2026-11-01 (Render free hours reset): New Web Service from this folder, free plan.
+# Environment variables to set once:
+#   OPENAI_API_KEY     the key the proxy spends (already validated, in ../../.env)
+#   AWS_PROMPT_SHA256  one hash per Aws mode, comma-separated: python deploy/aws-proxy/prompt_sha256.py (from the World Watch folder)
+# Then put the service URL + /api/aws in site/data/config.json as "aiProxy".
 services:
   - type: web
     name: worldwatch-aws
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 60
+    # --workers 1 is required: the cache, rate limiter and budget live in process memory.
+    # --max-requests recycles the worker so memory cannot creep on a long-lived free dyno.
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 60 --max-requests 500 --max-requests-jitter 50 --access-logfile -
     envVars:
       - key: WW_SITE
         value: https://death242-worldwatch.static.hf.space
       - key: OPENAI_API_KEY
         sync: false
+      - key: AWS_PROMPT_SHA256
+        sync: false
+      - key: AWS_ADMIN_TOKEN
+        sync: false
+      - key: AWS_DAILY_BUDGET
+        value: "400"
